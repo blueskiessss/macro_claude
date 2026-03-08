@@ -97,6 +97,9 @@ ASSET_TICKERS = {
 # Commodities also get macro momentum treatment (price level)
 COMMODITY_MACRO_LABELS = ["Gold (GC)", "Silver (SI)", "Copper (HG)", "Oil WTI (CL)"]
 
+# FX labels that require 4-decimal-place price formatting
+_FX_LABELS = {"EUR/USD", "GBP/USD", "USD/JPY"}
+
 # ---------------------------------------------------------------------------
 # Data Fetching
 # ---------------------------------------------------------------------------
@@ -363,7 +366,7 @@ def check_data_availability(macro_momentum: dict, asset_metrics: dict) -> None:
     """
     total, valid = 0, 0
 
-    for label, stats in macro_momentum.items():
+    for _, stats in macro_momentum.items():
         total += 1
         if pd.notna(stats.get("latest", np.nan)):
             valid += 1
@@ -387,17 +390,16 @@ def check_data_availability(macro_momentum: dict, asset_metrics: dict) -> None:
 # Prompt Building
 # ---------------------------------------------------------------------------
 
-def _fmt(val, decimals=3):
-    """Format a float value for table display, showing 'n/a' for NaN."""
+def _fmt(val, decimals=3, sign=True):
+    """Format a float value for table display, showing 'n/a' for NaN.
+
+    sign=True (default): prefix positive numbers with '+'.
+    sign=False: plain decimal formatting (no sign prefix).
+    """
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return "n/a"
-    return f"{val:+.{decimals}f}" if val != 0 else f"{val:.{decimals}f}"
-
-
-def _fmt_plain(val, decimals=2):
-    """Format a float value without sign prefix."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return "n/a"
+    if sign:
+        return f"{val:+.{decimals}f}" if val != 0 else f"{val:.{decimals}f}"
     return f"{val:.{decimals}f}"
 
 
@@ -433,8 +435,8 @@ def build_prompt(
         ],
     }
 
-    def macro_table_rows(labels: list, data: dict) -> str:
-        header = f"{'Series':<35} {'Latest':>10} {'3M Chg':>10} {'12M Chg':>10} {'3M/3M':>10} {'3M/12M':>10}"
+    def macro_table_rows(labels: list, data: dict, row_label: str = "Series") -> str:
+        header = f"{row_label:<35} {'Latest':>10} {'3M Chg':>10} {'12M Chg':>10} {'3M/3M':>10} {'3M/12M':>10}"
         sep = "-" * len(header)
         rows = [header, sep]
         for lbl in labels:
@@ -443,7 +445,7 @@ def build_prompt(
                 continue
             rows.append(
                 f"{lbl:<35} "
-                f"{_fmt_plain(stats['latest']):>10} "
+                f"{_fmt(stats['latest'], sign=False):>10} "
                 f"{_fmt(stats['3m_change']):>10} "
                 f"{_fmt(stats['12m_change']):>10} "
                 f"{_fmt(stats['3m_of_3m']):>10} "
@@ -458,21 +460,9 @@ def build_prompt(
         country_blocks.append(block)
 
     # Commodity macro table
-    comm_header = f"{'Commodity':<35} {'Latest':>10} {'3M Chg':>10} {'12M Chg':>10} {'3M/3M':>10} {'3M/12M':>10}"
-    comm_sep = "-" * len(comm_header)
-    comm_rows = [comm_header, comm_sep]
-    for lbl in COMMODITY_MACRO_LABELS:
-        stats = commodity_momentum.get(lbl)
-        if stats is None:
-            continue
-        comm_rows.append(
-            f"{lbl:<35} "
-            f"{_fmt_plain(stats['latest']):>10} "
-            f"{_fmt(stats['3m_change']):>10} "
-            f"{_fmt(stats['12m_change']):>10} "
-            f"{_fmt(stats['3m_of_3m']):>10} "
-            f"{_fmt(stats['3m_of_12m']):>10}"
-        )
+    comm_rows = macro_table_rows(
+        COMMODITY_MACRO_LABELS, commodity_momentum, row_label="Commodity"
+    ).split("\n")
 
     # Asset momentum and valuation table
     asset_header = f"{'Asset':<35} {'6M Sharpe':>10} {'5Y Pctile':>10}"
@@ -481,8 +471,8 @@ def build_prompt(
     for lbl, stats in asset_metrics.items():
         asset_rows.append(
             f"{lbl:<35} "
-            f"{_fmt_plain(stats['sharpe_6m'], 3):>10} "
-            f"{_fmt_plain(stats['pct_5y'], 1):>10}"
+            f"{_fmt(stats['sharpe_6m'], decimals=3, sign=False):>10} "
+            f"{_fmt(stats['pct_5y'], decimals=1, sign=False):>10}"
         )
 
     prompt = f"""
@@ -703,7 +693,6 @@ def calc_trade_levels(trade: dict, asset_prices: dict) -> dict:
     For RV: spread vol-based stop/target.
     """
     na = {"entry": "N/A", "stop": "N/A", "target": "N/A"}
-    _FX_LABELS = {"EUR/USD", "GBP/USD", "USD/JPY"}
 
     def is_fx(label):
         return label in _FX_LABELS if label else False
@@ -714,39 +703,31 @@ def calc_trade_levels(trade: dict, asset_prices: dict) -> dict:
     long_leg  = trade.get("long_leg")
     short_leg = trade.get("short_leg")
 
-    # Directional trade
-    if long_leg and not short_leg:
-        prices = asset_prices.get(long_leg, pd.Series(dtype=float)).dropna()
+    def _directional(label: str, is_long: bool) -> dict:
+        """Compute entry/stop/target for a single-leg directional trade."""
+        prices = asset_prices.get(label, pd.Series(dtype=float)).dropna()
         if len(prices) < 61:
             return na
         try:
             log_ret = np.log(prices / prices.shift(1)).dropna()
             vol_60d = float(log_ret.iloc[-60:].std() * np.sqrt(252))
             entry = float(prices.iloc[-1])
+            sign = 1 if is_long else -1
             return {
-                "entry":  fmt(entry, long_leg),
-                "stop":   fmt(entry * (1 - 0.5  * vol_60d), long_leg),
-                "target": fmt(entry * (1 + 0.75 * vol_60d), long_leg),
+                "entry":  fmt(entry, label),
+                "stop":   fmt(entry * (1 - sign * 0.5  * vol_60d), label),
+                "target": fmt(entry * (1 + sign * 0.75 * vol_60d), label),
             }
         except Exception:
             return na
 
+    # Directional trade
+    if long_leg and not short_leg:
+        return _directional(long_leg, is_long=True)
+
     # Short-only directional
     if short_leg and not long_leg:
-        prices = asset_prices.get(short_leg, pd.Series(dtype=float)).dropna()
-        if len(prices) < 61:
-            return na
-        try:
-            log_ret = np.log(prices / prices.shift(1)).dropna()
-            vol_60d = float(log_ret.iloc[-60:].std() * np.sqrt(252))
-            entry = float(prices.iloc[-1])
-            return {
-                "entry":  fmt(entry, short_leg),
-                "stop":   fmt(entry * (1 + 0.5  * vol_60d), short_leg),
-                "target": fmt(entry * (1 - 0.75 * vol_60d), short_leg),
-            }
-        except Exception:
-            return na
+        return _directional(short_leg, is_long=False)
 
     # Relative value trade
     if long_leg and short_leg:
@@ -869,20 +850,12 @@ def main():
     # 6. Compute macro momentum (all FRED + OECD + ECB series)
     macro_momentum = calc_macro_momentum(fred_data, is_daily_map)
 
-    # 7. Compute commodity macro momentum from asset prices
-    commodity_momentum = {}
-    for lbl in COMMODITY_MACRO_LABELS:
-        prices = asset_prices.get(lbl, pd.Series(dtype=float))
-        if not prices.empty:
-            # Daily price series — use daily offsets
-            commodity_momentum[lbl] = calc_macro_momentum(
-                {lbl: prices}, {lbl: True}
-            )[lbl]
-        else:
-            commodity_momentum[lbl] = {
-                "latest": np.nan, "3m_change": np.nan,
-                "12m_change": np.nan, "3m_of_3m": np.nan, "3m_of_12m": np.nan
-            }
+    # 7. Compute commodity macro momentum from asset prices (all daily series)
+    commodity_prices = {lbl: asset_prices.get(lbl, pd.Series(dtype=float))
+                        for lbl in COMMODITY_MACRO_LABELS}
+    commodity_momentum = calc_macro_momentum(
+        commodity_prices, {lbl: True for lbl in COMMODITY_MACRO_LABELS}
+    )
 
     # 8. Compute asset momentum and valuation metrics
     asset_metrics = calc_asset_metrics(asset_prices)
