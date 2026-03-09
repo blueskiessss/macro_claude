@@ -407,6 +407,7 @@ def build_prompt(
     macro_momentum: dict,
     commodity_momentum: dict,
     asset_metrics: dict,
+    fred_data: dict,
 ) -> str:
     """
     Build a structured 3-layer prompt for the LLM.
@@ -475,6 +476,36 @@ def build_prompt(
             f"{_fmt(stats['pct_5y'], decimals=1, sign=False):>10}"
         )
 
+    # --- Central Bank Rate-of-Change Table ---
+    _CB_RATE_SERIES = [
+        ("United States",  "US CB Rate"),
+        ("Eurozone",       "Eurozone CB Rate"),
+        ("United Kingdom", "UK CB Rate"),
+        ("Japan",          "Japan CB Rate"),
+    ]
+    _cb_lines = [
+        f"{'Country':<18} {'Obs-1':>8} {'Obs-2':>8} {'Obs-3':>8} {'3M Chg':>9} {'6M Chg':>9} {'Stance'}"
+    ]
+    _cb_lines.append("-" * 72)
+    for _country, _key in _CB_RATE_SERIES:
+        _s = fred_data.get(_key, pd.Series(dtype=float)).dropna()
+        if len(_s) < 7:
+            _cb_lines.append(f"{_country:<18}  (insufficient data)")
+            continue
+        _latest = _s.iloc[-1]
+        _prev1  = _s.iloc[-2]
+        _prev2  = _s.iloc[-3]
+        _val_3m = _s.iloc[-4]
+        _val_6m = _s.iloc[-7]
+        _chg_3m = _latest - _val_3m
+        _chg_6m = _latest - _val_6m
+        _stance = "Easing" if _chg_3m < -0.05 else ("Tightening" if _chg_3m > 0.05 else "Neutral")
+        _cb_lines.append(
+            f"{_country:<18} {_latest:>8.3f} {_prev1:>8.3f} {_prev2:>8.3f} "
+            f"{_chg_3m:>+9.3f} {_chg_6m:>+9.3f} {_stance}"
+        )
+    cb_block = "\n".join(_cb_lines)
+
     prompt = f"""
 You are a discretionary macro portfolio manager's analytical engine. Your role is to classify macroeconomic regimes and generate actionable trade ideas from structured data.
 
@@ -504,6 +535,9 @@ Note on asset table:
 - 5Y Percentile: where today's 6M Sharpe sits in its 5-year rolling history (0=lowest ever, 100=highest ever).
 - USD/JPY (JPY=X): higher = weaker JPY. Interpret momentum direction accordingly.
 
+## Central Bank Rate Changes (derived — use this for CB stance, not raw level)
+{cb_block}
+
 ========================================================
 LAYER 2: REGIME CLASSIFICATION
 ========================================================
@@ -516,6 +550,7 @@ For each country classify:
 2. Inflation: "Rising" | "Stable" | "Falling"
 3. Quadrant: "Goldilocks" | "Reflation" | "Stagflation" | "Recession"
 4. CB Stance: "Easing" | "Neutral" | "Tightening"
+   Use the Central Bank Rate Changes table above for CB Stance classification. The derived stance values are pre-computed — treat them as ground truth unless the rationale is clearly contradicted by the growth/inflation data.
 5. Yield Curve: "Steepening" | "Flat" | "Inverting" | "N/A"
 6. Rationale: one sentence per country summarising the key signal
 
@@ -527,12 +562,40 @@ Based on the regime classifications and asset momentum/valuation data, generate 
 trade ideas. Only generate an idea where the data genuinely supports conviction.
 Do not force ideas to fill a quota.
 
+STEP 1 — CLASSIFY EACH IDEA AS MOMENTUM OR MEAN REVERSION BEFORE SELECTING IT:
+
+Every trade must be one of:
+  A) MOMENTUM: Price trend is aligned with and confirmed by the macro regime.
+     Entry criteria: 5Y percentile between 40th and 85th. Trend is intact but not exhausted.
+     If 5Y percentile > 85th: flag as "extended momentum" — only select if regime is
+     unambiguously supportive AND no contrary signals exist. Reduce confidence by one level.
+
+  B) MEAN REVERSION: Price trend is dislocated from the macro regime (price has moved
+     far but fundamentals don't support continuation).
+     Entry criteria: 5Y percentile > 80th AND momentum visibly fading (Sharpe declining),
+     OR 5Y percentile < 20th AND macro regime turning supportive.
+     Mean reversion requires MULTIPLE INDEPENDENT CONFIRMATIONS:
+       - Regime clearly contradicts price trend
+       - Momentum at or near exhaustion (>85th or <15th percentile)
+       - At least one additional confirmation (positioning, valuation, yield differential, policy)
+     If these criteria are not all met, do not generate the idea.
+
+STEP 2 — POPULATE THE trade_type FIELD IN THE JSON OUTPUT:
+  Set "trade_type": "momentum" or "trade_type": "mean_reversion" for every idea.
+
+STEP 3 — POPULATE momentum_valuation FIELD WITH EXPLICIT LOGIC:
+  For momentum trades: explain why the percentile confirms trend continuation (not exhaustion).
+  For mean reversion trades: explain all three confirmations explicitly. If you cannot
+  articulate three independent confirmations, drop the idea.
+
 Rules:
-- Directional trades (long or short a single asset) are allowed and preferred where conviction is clear.
-- Relative value (long one / short another) is allowed within the same asset class only.
-- Individual commodity longs or shorts are allowed.
-- FX trades must be expressed as pairs (e.g. "Long EUR/USD"). Never single-leg FX.
-- USD/JPY: higher = weaker JPY. Short USD/JPY = bullish JPY.
+- Directional trades (long or short a single asset) are preferred over relative value.
+- Relative value only within the same asset class.
+- FX trades must be expressed as pairs. Never single-leg FX.
+- USD/JPY: higher = weaker JPY. Short USD/JPY = bullish JPY. Set short_leg="USD/JPY", long_leg=null.
+- CRITICAL: For short trades, set short_leg to the shorted asset and long_leg to null.
+  For long trades, set long_leg to the bought asset and short_leg to null.
+  Never put a shorted asset in long_leg.
 
 ========================================================
 OUTPUT FORMAT — CRITICAL
@@ -564,13 +627,15 @@ code fences. The JSON must exactly follow this schema:
       "rationale": "how macro regime supports this trade",
       "momentum_valuation": "what 6M Sharpe and 5Y percentile tell you",
       "confidence": "High|Medium|Low",
-      "confidence_reasoning": "key reason for conviction level and primary risk"
+      "confidence_reasoning": "key reason for conviction level and primary risk",
+      "trade_type": "momentum|mean_reversion"
     }}
   ]
 }}
 
 Use exact asset labels from the asset table (e.g. "US Equity (SPY)", "EUR/USD", "Gold (GC)").
 The trade_ideas array may contain 0 to 3 items. Return an empty array if no ideas meet conviction bar.
+CRITICAL: For short trades, set short_leg to the asset being shorted and long_leg to null. For long trades, set long_leg to the asset being bought and short_leg to null. Never put a shorted asset in long_leg.
 """
 
     return prompt.strip()
@@ -723,7 +788,9 @@ def calc_trade_levels(trade: dict, asset_prices: dict) -> dict:
 
     # Directional trade
     if long_leg and not short_leg:
-        return _directional(long_leg, is_long=True)
+        description = trade.get("description", "").lower()
+        is_long = not any(w in description for w in ["short", "sell"])
+        return _directional(long_leg, is_long=is_long)
 
     # Short-only directional
     if short_leg and not long_leg:
@@ -785,6 +852,7 @@ def build_plain_text_email(parsed: dict, levels: list) -> str:
     else:
         for i, trade in enumerate(trade_ideas):
             lines.append(f"TRADE {trade.get('id', i+1)}: {trade.get('description', '')}")
+            lines.append(f"  Type:                 {trade.get('trade_type', 'N/A')}")
             lines.append(f"  Rationale:            {trade.get('rationale', '')}")
             lines.append(f"  Momentum/Valuation:   {trade.get('momentum_valuation', '')}")
             lines.append(f"  Confidence:           {trade.get('confidence', '')} \u2014 {trade.get('confidence_reasoning', '')}")
@@ -864,7 +932,7 @@ def main():
     check_data_availability(macro_momentum, asset_metrics)
 
     # 10. Build prompt
-    prompt = build_prompt(macro_momentum, commodity_momentum, asset_metrics)
+    prompt = build_prompt(macro_momentum, commodity_momentum, asset_metrics, fred_data)
 
     # 11. Call LLM
     log.info("Calling LLM...")
