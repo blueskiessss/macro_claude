@@ -620,14 +620,14 @@ code fences. The JSON must exactly follow this schema:
   "trade_ideas": [
     {{
       "id": 1,
+      "trade_type": "momentum|mean_reversion",
       "description": "e.g. Long SPY, Long EUR/USD, Long Gold (GC)",
       "long_leg": "exact label from ASSET_TICKERS or null",
       "short_leg": "exact label from ASSET_TICKERS or null",
       "rationale": "how macro regime supports this trade",
       "momentum_valuation": "what 6M Sharpe and 5Y percentile tell you",
       "confidence": "High|Medium|Low",
-      "confidence_reasoning": "key reason for conviction level and primary risk",
-      "trade_type": "momentum|mean_reversion"
+      "confidence_reasoning": "key reason for conviction level and primary risk"
     }}
   ]
 }}
@@ -692,9 +692,20 @@ def parse_llm_response(response_text: str) -> dict:
             if country not in regimes:
                 regimes[country] = empty_regime.copy()
 
+        trade_ideas = data.get("trade_ideas", [])
+        for idea in trade_ideas:
+            if not idea.get("trade_type"):
+                mv = (idea.get("momentum_valuation") or "").lower()
+                inferred = "mean_reversion" if "mean reversion" in mv else "momentum"
+                idea["trade_type"] = inferred
+                log.warning(
+                    f"Trade idea {idea.get('id')}: missing trade_type — "
+                    f"inferred '{inferred}' from momentum_valuation"
+                )
+
         return {
             "regimes": regimes,
-            "trade_ideas": data.get("trade_ideas", []),
+            "trade_ideas": trade_ideas,
             "raw_response": response_text,
         }
 
