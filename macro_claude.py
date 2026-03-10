@@ -18,7 +18,6 @@ import re
 import smtplib
 import warnings
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import numpy as np
@@ -62,7 +61,7 @@ FRED_SERIES = {
     # Central bank rates
     "US CB Rate":              ("FEDFUNDS",         "monthly"),
     "Eurozone CB Rate":        ("ECBDFR",           "monthly"),
-    "UK CB Rate":              ("IUDSOIA",          "daily"),    # daily, resample to monthly mean
+    "UK CB Rate":              ("IUDSOIA",          "daily_to_monthly"),  # daily, resample to monthly mean
     "Japan CB Rate":           ("IRSTCI01JPM156N",  "monthly"),
     # Yield curve
     "US Yield Curve (2s10s)":  ("T10Y2Y",          "daily"),    # use daily data directly
@@ -109,7 +108,7 @@ def fetch_fred_data() -> dict:
     Fetch all FRED series. Returns dict of {label: pd.Series}.
     Daily series are kept at daily frequency.
     Monthly series are resampled to monthly last value.
-    UK CB Rate (daily) is resampled to monthly mean before returning.
+    "daily_to_monthly" series (e.g. UK CB Rate) are resampled to monthly mean.
     On individual series failure, logs a warning and stores an empty Series.
     """
     fred_key = os.environ.get("FRED_API_KEY", "")
@@ -129,8 +128,8 @@ def fetch_fred_data() -> dict:
             if freq == "monthly":
                 # Monthly series: resample to month-end last observation
                 series = raw.resample("ME").last().dropna()
-            elif label == "UK CB Rate":
-                # Daily series that we want as monthly for CB rate context
+            elif freq == "daily_to_monthly":
+                # Daily series resampled to monthly mean (e.g. UK CB Rate)
                 series = raw.resample("ME").mean().dropna()
             else:
                 # Keep daily (e.g. US Yield Curve 2s10s)
@@ -238,7 +237,7 @@ def fetch_asset_prices() -> dict:
 
 def _safe_iloc(series: pd.Series, idx: int):
     """Return series.iloc[idx] if index is valid, else NaN."""
-    if len(series) > abs(idx):
+    if len(series) >= abs(idx):
         val = series.iloc[idx]
         return float(val) if pd.notna(val) else np.nan
     return np.nan
@@ -310,7 +309,7 @@ def calc_asset_metrics(price_dict: dict) -> dict:
     Calculate 6M Sharpe ratio and 5Y percentile for each asset.
 
     6M Sharpe:
-        mean(daily returns, last 126 days) / std(daily returns, last 126 days) * sqrt(125)
+        mean(daily returns, last 126 days) / std(daily returns, last 126 days) * sqrt(252)
         Risk-free rate = 0.
 
     5Y Percentile:
@@ -621,14 +620,14 @@ code fences. The JSON must exactly follow this schema:
   "trade_ideas": [
     {{
       "id": 1,
+      "trade_type": "momentum|mean_reversion",
       "description": "e.g. Long SPY, Long EUR/USD, Long Gold (GC)",
       "long_leg": "exact label from ASSET_TICKERS or null",
       "short_leg": "exact label from ASSET_TICKERS or null",
       "rationale": "how macro regime supports this trade",
       "momentum_valuation": "what 6M Sharpe and 5Y percentile tell you",
       "confidence": "High|Medium|Low",
-      "confidence_reasoning": "key reason for conviction level and primary risk",
-      "trade_type": "momentum|mean_reversion"
+      "confidence_reasoning": "key reason for conviction level and primary risk"
     }}
   ]
 }}
@@ -652,7 +651,7 @@ def call_llm(prompt: str) -> str:
     """
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from environment
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -693,9 +692,20 @@ def parse_llm_response(response_text: str) -> dict:
             if country not in regimes:
                 regimes[country] = empty_regime.copy()
 
+        trade_ideas = data.get("trade_ideas", [])
+        for idea in trade_ideas:
+            if not idea.get("trade_type"):
+                mv = (idea.get("momentum_valuation") or "").lower()
+                inferred = "mean_reversion" if "mean reversion" in mv else "momentum"
+                idea["trade_type"] = inferred
+                log.warning(
+                    f"Trade idea {idea.get('id')}: missing trade_type — "
+                    f"inferred '{inferred}' from momentum_valuation"
+                )
+
         return {
             "regimes": regimes,
-            "trade_ideas": data.get("trade_ideas", []),
+            "trade_ideas": trade_ideas,
             "raw_response": response_text,
         }
 
@@ -770,8 +780,13 @@ def calc_trade_levels(trade: dict, asset_prices: dict) -> dict:
 
     def _directional(label: str, is_long: bool) -> dict:
         """Compute entry/stop/target for a single-leg directional trade."""
-        prices = asset_prices.get(label, pd.Series(dtype=float)).dropna()
+        prices_raw = asset_prices.get(label)
+        if prices_raw is None:
+            log.warning(f"calc_trade_levels: label '{label}' not found in asset_prices keys: {list(asset_prices.keys())}")
+            return na
+        prices = prices_raw.dropna()
         if len(prices) < 61:
+            log.warning(f"calc_trade_levels: insufficient price history for '{label}' ({len(prices)} obs, need 61)")
             return na
         try:
             log_ret = np.log(prices / prices.shift(1)).dropna()
@@ -783,14 +798,13 @@ def calc_trade_levels(trade: dict, asset_prices: dict) -> dict:
                 "stop":   fmt(entry * (1 - sign * 0.5  * vol_60d), label),
                 "target": fmt(entry * (1 + sign * 0.75 * vol_60d), label),
             }
-        except Exception:
+        except Exception as exc:
+            log.warning(f"calc_trade_levels: exception computing levels for '{label}': {exc}")
             return na
 
-    # Directional trade
+    # Directional long trade — long_leg is set by schema definition, so is always long
     if long_leg and not short_leg:
-        description = trade.get("description", "").lower()
-        is_long = not any(w in description for w in ["short", "sell"])
-        return _directional(long_leg, is_long=is_long)
+        return _directional(long_leg, is_long=True)
 
     # Short-only directional
     if short_leg and not long_leg:
@@ -798,13 +812,22 @@ def calc_trade_levels(trade: dict, asset_prices: dict) -> dict:
 
     # Relative value trade
     if long_leg and short_leg:
-        lp = asset_prices.get(long_leg,  pd.Series(dtype=float)).dropna()
-        sp = asset_prices.get(short_leg, pd.Series(dtype=float)).dropna()
+        lp = asset_prices.get(long_leg)
+        sp = asset_prices.get(short_leg)
+        if lp is None:
+            log.warning(f"calc_trade_levels: RV long_leg '{long_leg}' not found in asset_prices")
+            return na
+        if sp is None:
+            log.warning(f"calc_trade_levels: RV short_leg '{short_leg}' not found in asset_prices")
+            return na
+        lp, sp = lp.dropna(), sp.dropna()
         if len(lp) < 61 or len(sp) < 61:
+            log.warning(f"calc_trade_levels: insufficient history for RV — {long_leg}:{len(lp)}, {short_leg}:{len(sp)}")
             return na
         try:
             combined = pd.DataFrame({"long": lp, "short": sp}).dropna()
             if len(combined) < 61:
+                log.warning(f"calc_trade_levels: insufficient aligned history for RV ({len(combined)} obs)")
                 return na
             spread = (combined["long"] - combined["short"]).iloc[-126:]
             entry = float(spread.iloc[-1])
@@ -816,9 +839,11 @@ def calc_trade_levels(trade: dict, asset_prices: dict) -> dict:
                 "stop":   f(entry - spread_vol * 0.5),
                 "target": f(entry + spread_vol * 0.75),
             }
-        except Exception:
+        except Exception as exc:
+            log.warning(f"calc_trade_levels: exception computing RV spread levels: {exc}")
             return na
 
+    log.warning(f"calc_trade_levels: no valid leg found — long_leg={long_leg!r}, short_leg={short_leg!r}")
     return na
 
 
@@ -912,7 +937,7 @@ def main():
     is_daily_map = {
         "US Yield Curve (2s10s)": True,
         "Eurozone 2s10s Yield Curve": True,
-        # UK CB Rate was resampled to monthly already; treat as monthly
+        # UK CB Rate is resampled to monthly via "daily_to_monthly" freq; treat as monthly here
     }
 
     # 6. Compute macro momentum (all FRED + OECD + ECB series)
